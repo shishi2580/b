@@ -1,0 +1,203 @@
+name: Build KernelSU for Redmi K20 Pro (Official Source)
+
+on:
+  workflow_dispatch:  # 手动触发
+  push:               # 推送时触发
+    branches: [ main ]
+
+env:
+  KERNEL_DIR: raphael-kernel
+
+jobs:
+  build:
+    runs-on: ubuntu-latest  # GitHub 16GB内存服务器
+    
+    steps:
+    # 1. 准备环境
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      
+    # 2. 下载官方红米K20 Pro内核源码
+    - name: Download Xiaomi Official Kernel
+      run: |
+        echo "正在下载小米官方内核源码..."
+        # 小米官方仓库
+        git clone https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git -b raphael-p-oss --depth=1 ${{ env.KERNEL_DIR }}
+        
+        # 验证下载
+        cd ${{ env.KERNEL_DIR }}
+        echo "内核版本："
+        grep "VERSION\|PATCHLEVEL" Makefile
+        ls -la
+        
+    # 3. 安装编译工具
+    - name: Install Build Tools
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          build-essential \
+          gcc-aarch64-linux-gnu \
+          gcc-10-aarch64-linux-gnu \
+          libssl-dev \
+          bc \
+          flex \
+          bison \
+          libelf-dev \
+          git \
+          curl \
+          python3 \
+          rsync
+        
+    # 4. 集成KernelSU（针对4.14内核）
+    - name: Integrate KernelSU
+      run: |
+        cd ${{ env.KERNEL_DIR }}
+        
+        echo "=== 集成KernelSU ==="
+        
+        # 方法1：下载KSU源码到drivers目录
+        cd drivers
+        rm -rf kernelsu 2>/dev/null || true
+        git clone https://github.com/tiann/KernelSU.git kernelsu
+        cd kernelsu
+        git checkout legacy  # 4.14内核必须用legacy分支
+        cd ../../
+        
+        # 方法2：修改配置文件
+        echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
+        echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+        
+        echo "KSU集成完成"
+        ls drivers/kernelsu/
+        
+    # 5. 配置内核
+    - name: Configure Kernel
+      run: |
+        cd ${{ env.KERNEL_DIR }}
+        
+        echo "=== 配置内核 ==="
+        
+        # 设置环境变量
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        
+        # 使用红米K20 Pro的配置
+        if [ -f "arch/arm64/configs/raphael_defconfig" ]; then
+          echo "使用raphael_defconfig"
+          make raphael_defconfig
+        elif [ -f "arch/arm64/configs/vendor/raphael_defconfig" ]; then
+          echo "使用vendor/raphael_defconfig"
+          make vendor/raphael_defconfig
+        else
+          echo "可用的配置文件："
+          ls arch/arm64/configs/ | grep -i raphael
+          # 使用默认配置
+          make defconfig
+        fi
+        
+        # 启用KernelSU
+        ./scripts/config --enable KSU
+        ./scripts/config --module KSU
+        
+        # 禁用调试信息以减小大小
+        ./scripts/config --disable DEBUG_INFO
+        ./scripts/config --disable IKCONFIG
+        
+        # 保存配置
+        cp .config arch/arm64/configs/raphael_ksu_defconfig
+        
+        echo "配置完成"
+        
+    # 6. 开始编译
+    - name: Build Kernel
+      timeout-minutes: 90  # 最长90分钟
+      run: |
+        cd ${{ env.KERNEL_DIR }}
+        
+        echo "=== 开始编译内核 ==="
+        echo "开始时间：$(date)"
+        
+        # 设置环境
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        
+        # 显示编译信息
+        echo "CPU核心数：$(nproc)"
+        echo "内存："
+        free -h
+        
+        # 开始编译（使用所有核心）
+        make -j$(nproc) 2>&1 | tee build.log
+        
+        echo "编译完成时间：$(date)"
+        
+        # 检查输出文件
+        echo "=== 编译输出 ==="
+        ls -lh arch/arm64/boot/
+        echo "文件大小："
+        ls -lh arch/arm64/boot/Image*
+        
+        # 检查编译日志
+        echo "=== 编译摘要 ==="
+        tail -20 build.log
+        
+    # 7. 创建刷机包
+    - name: Create Flashable ZIP
+      run: |
+        cd ${{ env.KERNEL_DIR }}
+        
+        echo "=== 创建刷机包 ==="
+        
+        # 下载AnyKernel3
+        wget -q https://github.com/osm0sis/AnyKernel3/archive/refs/heads/master.zip
+        unzip -q master.zip
+        mv AnyKernel3-master anykernel
+        
+        # 复制内核文件
+        cp arch/arm64/boot/Image.gz-dtb anykernel/
+        
+        # 创建anykernel.sh
+        cat > anykernel/anykernel.sh << 'EOF'
+        #!/bin/bash
+        # AnyKernel3 for Redmi K20 Pro (Raphael) with KernelSU
+        
+        ## AnyKernel setup
+        properties() {
+          kernel.string=KernelSU for Raphael by GitHub Actions
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          device.name1=raphael
+          device.name2=raphaelin
+        }
+        
+        ## AnyKernel install
+        dump_boot() {
+          ui_print " "
+        }
+        
+        write_boot() {
+          ui_print " "
+        }
+        
+        # 清理函数
+        cleanup() {
+          rm -rf $ramdisk $patch $split_img
+        }
+        
+        # 主执行
+        setup_ak
+        dump_boot
+        write_boot
+        cleanup
+        EOF
+        
+        chmod +x anykernel/anykernel.sh
+        
+        # 创建安装脚本
+        cat > anykernel/META-INF/com/google/android/update-binary << 'EOF'
+        #!/sbin/sh
+        echo "正在刷入K
